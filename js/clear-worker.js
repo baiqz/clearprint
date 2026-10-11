@@ -110,65 +110,206 @@ function shortErr(e, url) {
   return raw.slice(0, 40);
 }
 
-/** 带进度的下载。CORS 响应里 content-length 是安全可读的白名单头。
- *
- *  ★ 必须带连接超时：外部镜像不可达时，浏览器默认可能挂上百秒，
- *    而「系统级故障要尽快中止」是批处理保护行为（其余图退回待处理）的前提。
- *    超时只覆盖「等响应头」，拿到头就撤掉 —— 慢网络下下载 199MB 不会被误杀。 */
-async function fetchBuffer(url, onPct, connectTimeoutMs) {
+// ---- 下载层 ---------------------------------------------------------------
+//
+// ★ 为什么必须「分段 + 重试」：线上模型是同源 208MB 分块，一次到底地拉，
+//   任何一个瞬时抖动都会让**已经拉到的几十 MB 全部作废**、直接换源。
+//   实测真机第一次跑就在 46MB 处 network error，前 46MB 白下。
+//   切成 8MB 段之后，一次抖动的代价只有当前这一段。
+//
+// ★ 重试只覆盖「网络类」失败。4xx 是确定性失败，重试只是白等 ——
+//   直接抛给上层去换源（这是「系统级故障要尽快中止」的一部分）。
+//
+// ★ 跨源不能带 Range：Range 不是 CORS 安全列表头，会给镜像源触发一个
+//   它多半答不上来的 OPTIONS 预检，把本来能用的兜底也弄坏。
+//   所以只在同源时分段，跨源仍走整份下载。
+const RANGE_SEG = 8 * 1048576;
+const SEG_TRIES = 3;
+const CONNECT_MS = 15000;      // 等响应头
+const STALL_MS = 20000;        // 拿到头之后，连续多久没字节算卡死
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function isSameOrigin(url) {
+  try { return new URL(url, self.location.href).origin === self.location.origin; }
+  catch (_) { return false; }
+}
+
+/** 4xx 里这几个是「确定不行」，重试只会白等。 */
+function fatalStatus(code) {
+  return code === 400 || code === 401 || code === 403 || code === 404
+      || code === 410 || code === 416 || code === 429;
+}
+
+/** 交互式停滞守卫：同一套 AbortController 先守「等响应头」再守「读 body」。
+ *  长时间没动静就主动 abort —— 让上层把这一段重试掉，
+ *  而不是挂着永远不返回（用户看到的「卡住不动」就是这种）。 */
+function stallGuard(ctl) {
+  let t = null;
+  return {
+    arm: (ms) => { if (t) clearTimeout(t); t = setTimeout(() => ctl.abort(), ms); },
+    stop: () => { if (t) { clearTimeout(t); t = null; } },
+  };
+}
+
+/** 读响应体，逐块回报。每次拿到数据都 arm 一次停滞计时。 */
+async function readStream(resp, onBytes, guard) {
+  if (!resp.body || typeof resp.body.getReader !== 'function') {
+    const buf = await resp.arrayBuffer();          // 老浏览器没有流式 body
+    if (onBytes) onBytes(buf.byteLength);
+    return buf;
+  }
+  const reader = resp.body.getReader();
+  const parts = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    n += value.length;
+    if (guard) guard.arm(STALL_MS);
+    if (onBytes) onBytes(n);
+  }
+  const out = new Uint8Array(n);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out.buffer;
+}
+
+/** 取 [start, end] 这一段。
+ *  返回 { whole, buf, total }：whole=true 表示服务器忽略了 Range、整份返回
+ *  （本地 serve.py 就是这种），这时 buf 就是整个文件，直接用它。 */
+async function fetchSeg(url, start, end, onBytes, ranged) {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), connectTimeoutMs || 15000);
+  const guard = stallGuard(ctl);
+  const headers = {};
+  if (ranged) headers.Range = 'bytes=' + start + '-' + end;
+  guard.arm(CONNECT_MS);
   let resp;
   try {
-    resp = await fetch(url, { mode: 'cors', credentials: 'omit', signal: ctl.signal });
+    resp = await fetch(url, {
+      mode: 'cors',
+      credentials: 'omit',
+      signal: ctl.signal,
+      headers: headers,
+    });
   } finally {
-    clearTimeout(timer);
+    guard.stop();
   }
-  if (!resp.ok) {
+
+  if (resp.status === 200) {
+    guard.arm(STALL_MS);
+    try {
+      const buf = await readStream(resp, onBytes, guard);
+      return { whole: true, buf: buf, total: buf.byteLength };
+    } finally {
+      guard.stop();
+    }
+  }
+  if (resp.status !== 206) {
     const err = new Error('HTTP ' + resp.status);
     err.httpStatus = resp.status;
     throw err;
   }
-  const total = Number(resp.headers.get('content-length') || 0);
-  if (!resp.body || typeof resp.body.getReader !== 'function') {
-    return await resp.arrayBuffer();       // 老浏览器没有流式 body，退化一次性读
+  const m = /\/(\d+)\s*$/.exec(resp.headers.get('content-range') || '');
+  guard.arm(STALL_MS);
+  try {
+    const buf = await readStream(resp, onBytes, guard);
+    return { whole: false, buf: buf, total: m ? Number(m[1]) : 0 };
+  } finally {
+    guard.stop();
   }
-  const reader = resp.body.getReader();
-  const chunks = [];
-  let got = 0;
+}
+
+/** 下载一个（大）文件，按段重试。onBytes(n) 报的是**本文件**已收字节数。 */
+async function pullRanged(url, onBytes, onRetry) {
+  const ranged = isSameOrigin(url);
+  const pieces = [];
+  let got = 0;            // 已**完整拿到**的字节（段边界）
+  let received = 0;       // 累计收到过的字节（含失败那次的半截）
+  let total = 0;
+  let tries = 0;
+
   for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    got += value.length;
-    if (onPct) {
-      onPct(total ? Math.min(99, Math.floor((got / total) * 100)) : 0, got, total);
+    const end = total ? Math.min(got + RANGE_SEG, total) - 1
+                      : got + RANGE_SEG - 1;
+    const base = got;
+    let res = null;
+    let last = null;
+    try {
+      res = await fetchSeg(url, got, end,
+        (n) => {
+          if (base + n > received) received = base + n;
+          if (onBytes) onBytes(base + n);
+        }, ranged);
+    } catch (e) {
+      last = e;
     }
+
+    if (res) {
+      tries = 0;
+      if (res.whole) return res.buf;            // 服务器整份返回 → 已完成
+      if (!total) total = res.total;
+      pieces.push(new Uint8Array(res.buf));
+      got += res.buf.byteLength;
+      if (!total || got >= total) break;
+      continue;
+    }
+
+    if (last && last.httpStatus && fatalStatus(last.httpStatus)) throw last;
+    // ★ 只在「已经下到字节」之后才重试。
+    //   一上来就碰不通（DNS 不通/被墙/连接超时）是系统级故障，重试只会把
+    //   「快中止」拖成 3 倍时长 —— 而批处理的保护行为（其余图退回待处理）
+    //   正依赖这个快速中止。已经下到字节再断才是真·抖动，那才值得重试这
+    //   一段（线上实测就是首段 46MB 处断，received>0 正是要救的场景）。
+    if (!received) throw last || new Error('下载失败');
+    tries++;
+    if (tries >= SEG_TRIES) throw last || new Error('下载中断');
+    if (onRetry) {
+      onRetry(tries, total ? Math.floor((got / total) * 100) : 0, got, total);
+    }
+    await sleep(300 * tries);
   }
+
   const out = new Uint8Array(got);
   let off = 0;
-  for (const c of chunks) { out.set(c, off); off += c.length; }
+  for (const p of pieces) { out.set(p, off); off += p.length; }
   return out.buffer;
 }
 
-/** 同源分块加载：按序拉取各块并拼接成完整模型。线上主路径。 */
-async function fetchParts(parts, totalBytes, onPct) {
-  const chunks = [];
+/** 单个文件（本地单文件 / 在线镜像）。onBytes 传本文件已收字节数。 */
+async function fetchBuffer(url, onBytes, onRetry) {
+  return await pullRanged(url, onBytes, onRetry);
+}
+
+/** 同源分块加载：按序拉取各块并拼接成完整模型。线上主路径。
+ *  onPct 拿到的是**整份模型**的进度（三块合起来算）。 */
+async function fetchParts(parts, totalBytes, onPct, onRetry) {
+  const pieces = [];
   let got = 0;
   for (const name of parts) {
     const url = self.__CP_BASE + 'models/' + name;
-    const buf = await fetchBuffer(url, (pct, g) => {
-      if (onPct) {
-        onPct(Math.min(99, Math.floor(((got + g) / totalBytes) * 100)), got + g, totalBytes);
-      }
-    });
-    chunks.push(new Uint8Array(buf));
+    const base = got;
+    const buf = await pullRanged(url,
+      (n) => {
+        if (onPct) {
+          const g = base + n;
+          onPct(Math.min(99, Math.floor((g / totalBytes) * 100)), g, totalBytes);
+        }
+      },
+      (attempt, pct, n) => {
+        if (onRetry) {
+          const g = base + n;
+          onRetry(attempt, Math.min(99, Math.floor((g / totalBytes) * 100)), g, totalBytes);
+        }
+      });
+    pieces.push(new Uint8Array(buf));
     got += buf.byteLength;
     if (onPct) onPct(Math.min(99, Math.floor((got / totalBytes) * 100)), got, totalBytes);
   }
   const out = new Uint8Array(got);
   let off = 0;
-  for (const c of chunks) { out.set(c, off); off += c.length; }
+  for (const c of pieces) { out.set(c, off); off += c.length; }
   return out.buffer;
 }
 
@@ -220,9 +361,16 @@ function init() {
             post(Object.assign({ type: 'progress', id: 'init', stage: 'model',
                                  pct: pct, got: got, bytes: bytes }, meta));
           };
+          // ★ 段内重试要**说出来**：否则用户只看到进度条倒退/不动，
+          //   以为卡死了。这里把「第几次重试 / 共几次」带上去。
+          const onRetry = (attempt, pct, got, bytes) => {
+            post(Object.assign({ type: 'progress', id: 'init', stage: 'model',
+                                 pct: pct || 0, got: got || 0, bytes: bytes || 0,
+                                 retry: attempt, tries: SEG_TRIES }, meta));
+          };
           buf = (src.kind === 'parts')
-            ? await fetchParts(src.parts, src.bytes, onPct)
-            : await fetchBuffer(src.url, onPct);
+            ? await fetchParts(src.parts, src.bytes, onPct, onRetry)
+            : await fetchBuffer(src.url, onPct, onRetry);
         } catch (e) {
           // ★ 下载失败只记一笔，换下一个源 —— 绝不在这里定生死
           tried.push(src.tag + '（' + shortErr(e, src.url) + '）');

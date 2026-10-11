@@ -213,6 +213,8 @@
     let t = 'AI 模型加载中 ' + pct + '%';
     if (m.bytes) t += '（' + mb(m.got || 0) + '/' + mb(m.bytes) + 'MB）';
     if (m.source && pct > 0) t += ' · ' + m.source;
+    // 段内重试要显示出来，否则用户只看到进度不动，以为卡死了
+    if (m.retry) t += ' · 网络抖动，重试 ' + m.retry + '/' + (m.tries || 3);
     return t;
   }
 
