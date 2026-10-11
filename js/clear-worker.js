@@ -55,6 +55,14 @@ const MODEL_MIRRORS = [
 /* 全部源都失败时，给用户的离线兜底入口 */
 const MODEL_DOWNLOAD_PAGE = 'https://github.com/baiqz/clearprint/releases';
 
+/* ★ 线上主路径：把 199MB 模型切成 3 块随站点一起发布（GitHub 单文件硬上限 100MB），
+   浏览器按序拉取后拼接。**同源**才是关键 ——
+   实测第三方镜像（hf-mirror）在真实浏览器里连首页都过不了 CORS
+   （corsError = MissingAllowOriginHeader），而 curl 访问同一地址完全正常。
+   同源没有 CORS 可言，是浏览器里唯一稳的托管方式。 */
+const MODEL_PARTS = ['lama_fp32.onnx.p1', 'lama_fp32.onnx.p2', 'lama_fp32.onnx.p3'];
+const MODEL_BYTES = 208044816;      // 与 models/lama_fp32.onnx 一致（切块脚本已校验拼接哈希）
+
 // ORT 配置：wasm-only。多线程需要 SharedArrayBuffer（= 需要跨源隔离）。
 // 线上 GitHub Pages 不能自定义响应头，靠 coi-serviceworker 注入 COOP/COEP；
 // 拿不到隔离时自动退回单线程 —— 照样能跑，只是慢一些。
@@ -63,14 +71,26 @@ ort.env.wasm.simd = true;
 ort.env.wasm.wasmPaths = self.__CP_BASE + 'vendor/ort/';
 
 /** 按顺序给出模型源。
- *  本地环境（开发 / 自用）模型就在项目里，**只认同源** ——
+ *  本地环境（开发 / 自用）模型就在项目里，**只认同源单文件** ——
  *  失败要立刻说清，不去等一个注定超时的外部请求：那会把「快速中止」
- *  拖成慢动作，连带让批处理的保护行为（其余图退回待处理）来不及生效。 */
+ *  拖成慢动作，连带让批处理的保护行为（其余图退回待处理）来不及生效。
+ *  线上则以站点分块为主（同源可靠），单文件与镜像只作兜底。 */
 function modelSources() {
-  const local = { url: self.__CP_BASE + 'models/lama_fp32.onnx', tag: '本机 models/' };
+  const local = {
+    kind: 'file',
+    url: self.__CP_BASE + 'models/lama_fp32.onnx',
+    tag: '本机 models/',
+  };
   if (IS_LOCAL) return [local];
-  const mirrors = MODEL_MIRRORS.map((u) => ({ url: u, tag: '在线镜像' }));
-  return mirrors.concat([local]);          // 同源留作自部署兜底
+  const parts = {
+    kind: 'parts',
+    parts: MODEL_PARTS,
+    bytes: MODEL_BYTES,
+    tag: '站点分块',
+    url: self.__CP_BASE + 'models/' + MODEL_PARTS[0],
+  };
+  const mirrors = MODEL_MIRRORS.map((u) => ({ kind: 'file', url: u, tag: '在线镜像' }));
+  return [parts, local].concat(mirrors);
 }
 
 /** 把异常压成一行短句，便于在「已尝试」列表里展示。
@@ -131,6 +151,27 @@ async function fetchBuffer(url, onPct, connectTimeoutMs) {
   return out.buffer;
 }
 
+/** 同源分块加载：按序拉取各块并拼接成完整模型。线上主路径。 */
+async function fetchParts(parts, totalBytes, onPct) {
+  const chunks = [];
+  let got = 0;
+  for (const name of parts) {
+    const url = self.__CP_BASE + 'models/' + name;
+    const buf = await fetchBuffer(url, (pct, g) => {
+      if (onPct) {
+        onPct(Math.min(99, Math.floor(((got + g) / totalBytes) * 100)), got + g, totalBytes);
+      }
+    });
+    chunks.push(new Uint8Array(buf));
+    got += buf.byteLength;
+    if (onPct) onPct(Math.min(99, Math.floor((got / totalBytes) * 100)), got, totalBytes);
+  }
+  const out = new Uint8Array(got);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out.buffer;
+}
+
 /** 所有源都失败时，拼出「说人话」的原因 —— 本地与线上给的建议不一样。 */
 function buildModelError(tried) {
   const head = 'AI 修复模型没能加载成功。';
@@ -175,10 +216,13 @@ function init() {
 
         try {
           post(Object.assign({ type: 'progress', id: 'init', stage: 'model', pct: 0 }, meta));
-          buf = await fetchBuffer(src.url, (pct, got, bytes) => {
+          const onPct = (pct, got, bytes) => {
             post(Object.assign({ type: 'progress', id: 'init', stage: 'model',
                                  pct: pct, got: got, bytes: bytes }, meta));
-          });
+          };
+          buf = (src.kind === 'parts')
+            ? await fetchParts(src.parts, src.bytes, onPct)
+            : await fetchBuffer(src.url, onPct);
         } catch (e) {
           // ★ 下载失败只记一笔，换下一个源 —— 绝不在这里定生死
           tried.push(src.tag + '（' + shortErr(e, src.url) + '）');

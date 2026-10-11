@@ -27,6 +27,20 @@ if (typeof window === 'undefined') {
             return;
         }
 
+        // ★ 只接管同源请求（对上游 coi-serviceworker 的必要修补）。
+        //   下面用 `new Response(...)` 重建响应，重建出来的 type 会变成 "default"，
+        //   跨源请求的 CORS 语义因此被破坏 —— 实测表现是跨源下载模型一律
+        //   "Failed to fetch"，而 curl 访问同一地址完全正常（CORS 头齐全）。
+        //   注入 COOP/COEP 本来也只需要覆盖同源的文档与资源，
+        //   跨源请求交给浏览器原生处理即可。
+        let sameOrigin = false;
+        try {
+            sameOrigin = new URL(r.url).origin === self.location.origin;
+        } catch (e) {
+            sameOrigin = false;
+        }
+        if (!sameOrigin) return;
+
         const request = (coepCredentialless && r.mode === "no-cors")
             ? new Request(r, {
                 credentials: "omit",
