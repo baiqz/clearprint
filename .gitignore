@@ -1,0 +1,11 @@
+# 测试夹具：72MB 的本地回归素材，与线上功能无关
+_e2e/
+
+# AI 模型：GitHub 单文件上限 100MB，放不下 199MB 的 lama_fp32.onnx。
+# 模型走 GitHub Release 托管，本地使用请按 README 下载到 models/ 目录。
+models/
+
+# 本地临时产物
+_scratch/
+*.log
+*.tmp
